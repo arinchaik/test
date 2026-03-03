@@ -1167,7 +1167,69 @@ Admin Path:
 | **Reconciliation Report** | รายงาน daily reconciliation | DB Read Replica |
 | **CSV Export** | Export ข้อมูลการจองเป็น CSV | DB Read Replica |
 
-> *Manual Release เป็น operation เดียวที่ Backoffice ต้องเขียนไปที่ Redis + DB Primary (ผ่าน dedicated API endpoint ที่มี rate limit แยก)
+#### Manual Release — ทำไมต้องเขียนไป Primary?
+
+Feature อื่นๆ ของ Backoffice อ่านข้อมูลอย่างเดียว (Read Replica + Redis read-only) แต่ **Manual Release เป็น operation เดียวที่ต้อง "เขียน"** เพราะต้องเปลี่ยนแปลงข้อมูลจริง:
+
+**Manual Release คืออะไร?**
+
+คือการที่ Admin **สั่งปล่อยตั๋วที่ lock ค้าง** กลับเข้าคลังด้วยมือ — ใช้ในกรณีฉุกเฉินที่ระบบอัตโนมัติ (TTL expire + Sweeper) ทำงานผิดพลาด
+
+```
+สถานการณ์ที่ต้องใช้ Manual Release:
+┌─────────────────────────────────────────────────────────┐
+│                                                          │
+│ 1. Lock ค้าง — Redis key expire แล้วแต่ DB ยังเป็น       │
+│    LOCKED อยู่ (Sweeper พลาด)                            │
+│    → ตั๋วหายไป 1 ใบ ไม่มีคนจองได้                       │
+│                                                          │
+│ 2. Payment Gateway ล่ม — user จ่ายเงินไม่ได้             │
+│    แต่ lock ยังไม่หมดอายุ                                │
+│    → Admin ต้อง release ให้คนอื่นจองแทน                  │
+│                                                          │
+│ 3. ข้อมูลไม่ตรง — Reconciliation report พบ mismatch      │
+│    → Admin ต้อง release lock ที่ค้างเพื่อแก้ไขยอด        │
+│                                                          │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Manual Release ต้องทำอะไรบ้าง?**
+
+```
+Admin กดปุ่ม "Release" บน Backoffice:
+
+  Step 1: INCR inventory:{slot_id}       ← เขียน Redis (คืนตั๋วเข้าคลัง)
+  Step 2: DEL lock:{slot_id}:{user_id}   ← เขียน Redis (ลบ lock key)
+  Step 3: UPDATE bookings                ← เขียน DB Primary
+          SET status = 'ADMIN_RELEASED'      (ไม่ใช่ Replica เพราะ
+          WHERE id = {booking_id}             Replica เขียนไม่ได้)
+  Step 4: INSERT admin_audit_log          ← เขียน DB Primary
+          (who, what, when)                  (บันทึกว่าใครทำ เมื่อไหร่)
+```
+
+ทุก step ต้อง **เขียน** → ใช้ Read Replica ไม่ได้ ต้องไปที่ Redis (read/write) + DB Primary
+
+**ทำไมไม่กระทบระบบหลัก?**
+
+แม้ Manual Release จะเขียนไปที่ Primary แต่ออกแบบให้ปลอดภัย:
+
+| มาตรการ | รายละเอียด |
+|---|---|
+| **Dedicated API endpoint** | แยก endpoint `/admin/manual-release` ออกจาก booking API — ไม่ใช้ route เดียวกัน |
+| **Rate limit แยก** | จำกัด 5 req/min per admin — Admin กด release ได้ไม่กี่ครั้งต่อนาที ไม่มีทาง flood DB |
+| **ใช้ไม่บ่อย** | ใช้เฉพาะกรณีฉุกเฉิน ไม่ได้กดทุกวินาทีเหมือน booking request |
+| **Audit log** | ทุกครั้งที่ใช้ต้อง log ว่า admin คนไหนทำ เมื่อไหร่ เพื่อตรวจสอบย้อนหลัง |
+| **Confirmation dialog** | ต้องกด confirm 2 ครั้ง ป้องกัน misclick |
+
+```
+เปรียบเทียบ load:
+
+Booking Service → DB Primary:    5,000 writes/sec (peak)
+Manual Release → DB Primary:     ~0.1 writes/sec (ไม่กี่ครั้งต่อ event)
+
+→ Manual Release คิดเป็น < 0.002% ของ load ทั้งหมด
+→ ไม่กระทบ Performance เด็ดขาด ✅
+```
 
 ---
 
