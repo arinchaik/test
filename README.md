@@ -18,6 +18,7 @@
 5. [Concurrency & Inventory Management](#5-concurrency--inventory-management)
 6. [Payment & Edge Cases](#6-payment--edge-cases)
 7. [Backoffice Architecture](#7-backoffice-architecture)
+8. [Project Estimation](#8-project-estimation) 
 
 ---
 
